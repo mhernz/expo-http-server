@@ -20,7 +20,10 @@ private class CRConnectionObserver: NSObject, CRServerDelegate {
 public class ExpoHttpServerModule: Module {
     private let server = CRHTTPServer()
     private var port: Int?
-    private var stopped = false
+    private var isListening = false
+    /// True after an explicit JS `stop()`; suppresses the
+    /// `OnAppEntersForeground` auto-resume until the next `ensureListening`.
+    private var userStopped = false
     private var responses = [String: CRResponse]()
     private var bgTaskIdentifier = UIBackgroundTaskIdentifier.invalid
 
@@ -36,57 +39,111 @@ public class ExpoHttpServerModule: Module {
 
         Events("onStatusUpdate", "onRequest", "onRequestCancel")
 
-        Function("setup", setupHandler)
-        Function("start", startHandler)
-        Function("route", routeHandler)
-        Function("respond", respondHandler)
-        Function("respondBinary", respondBinaryHandler)
-        Function("stop", stopHandler)
-    }
+        // Process-scoped wiring. Runs once per native module construction,
+        // which survives JS reloads — so routes and observers don't stack.
+        OnCreate {
+            self.connectionObserver.onConnectionClose = { [weak self] connection in
+                let connId = ObjectIdentifier(connection)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    guard let uuids = self.connectionToUuids.removeValue(forKey: connId) else { return }
+                    for uuid in uuids {
+                        self.uuidToConnection[uuid] = nil
+                        self.sendEvent("onRequestCancel", ["uuid": uuid])
+                    }
+                }
+            }
+            self.server.delegate = self.connectionObserver
 
-    private func setupHandler(port: Int) {
-        self.port = port;
-    }
-
-    private func startHandler() {
-        NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [unowned self] notification in
-            if (!self.stopped) {
-                self.startServer(status: "RESUMED", message: "Server resumed")
+            // One recursive catch-all per method; every request is dispatched
+            // to JS, which owns method+path routing. CRHTTPMethod has no
+            // `.all`, so we register four times — all forwarding to the same
+            // block. Criollo's matcher hands each request to exactly one
+            // route, so no fan-out within a single bind.
+            let methods: [CRHTTPMethod] = [.get, .post, .put, .delete, .options]
+            for method in methods {
+                self.server.add("/", block: self.dispatchBlock, recursive: true, method: method)
             }
         }
-        stopped = false;
-        startServer(status: "STARTED", message: "Server started")
+
+        OnAppEntersBackground {
+            self.beginBackgroundTask()
+        }
+
+        OnAppEntersForeground {
+            self.endBackgroundTask()
+            guard !self.isListening, !self.userStopped, let port = self.port else { return }
+            self.bindAndEmit(
+                port: port,
+                successStatus: "RESUMED",
+                successMessage: "Server resumed",
+                retriesRemaining: 1
+            )
+        }
+
+        OnDestroy {
+            self.stopServer()
+            self.endBackgroundTask()
+        }
+
+        AsyncFunction("ensureListening") { (port: Int, promise: Promise) in
+            self.userStopped = false
+            if self.isListening && self.port == port {
+                promise.resolve()
+                return
+            }
+            if self.isListening {
+                self.server.stopListening()
+                self.isListening = false
+            }
+            self.port = port
+            if self.bindAndEmit(port: port, successStatus: "STARTED", successMessage: "Server started") {
+                promise.resolve()
+            } else {
+                promise.reject(
+                    "ERR_SERVER_START",
+                    "Failed to bind HTTP server to port \(port)"
+                )
+            }
+        }
+
+        Function("respond", respondHandler)
+        Function("respondBinary", respondBinaryHandler)
+
+        AsyncFunction("stop") { (promise: Promise) in
+            self.userStopped = true
+            self.stopServer(status: "STOPPED", message: "Server stopped")
+            promise.resolve()
+        }
     }
 
-    private func routeHandler(path: String, method: String, uuid: String) {
-        server.add(path, block: { (req, res, next) in
-            // Per-request uuid so concurrent connections don't clobber each
-            // other's CRResponse in `self.responses`. The route-level `uuid`
-            // is forwarded separately so JS can locate its handler.
-            let requestUuid = UUID().uuidString
-            DispatchQueue.main.async {
-                var bodyString = "{}"
-                if let body = req.body, let bodyData = try? JSONSerialization.data(withJSONObject: body) {
-                    bodyString = String(data: bodyData, encoding: .utf8) ?? "{}"
-                }
-                self.responses[requestUuid] = res
-                if let connection = req.connection {
-                    let connId = ObjectIdentifier(connection)
-                    self.uuidToConnection[requestUuid] = connId
-                    self.connectionToUuids[connId, default: []].insert(requestUuid)
-                }
-                self.sendEvent("onRequest", [
-                    "uuid": requestUuid,
-                    "routeUuid": uuid,
-                    "method": req.method.toString(),
-                    "path": path,
-                    "body": bodyString,
-                    "headersJson": req.allHTTPHeaderFields.jsonString,
-                    "paramsJson": req.query.jsonString,
-                    "cookiesJson": req.cookies?.jsonString ?? "{}"
-                ])
+    /// Single Criollo route block used for all methods. Forwards every
+    /// request to JS via `onRequest`; JS dispatches to its handler and
+    /// calls `respond`/`respondBinary` with the per-request uuid.
+    private lazy var dispatchBlock: CRRouteBlock = { [weak self] req, res, _ in
+        guard let self = self else { return }
+        let requestUuid = UUID().uuidString
+        DispatchQueue.main.async {
+            var bodyString = "{}"
+            if let body = req.body, let bodyData = try? JSONSerialization.data(withJSONObject: body) {
+                bodyString = String(data: bodyData, encoding: .utf8) ?? "{}"
             }
-        }, recursive: false, method: CRHTTPMethod.fromString(method))
+            self.responses[requestUuid] = res
+            if let connection = req.connection {
+                let connId = ObjectIdentifier(connection)
+                self.uuidToConnection[requestUuid] = connId
+                self.connectionToUuids[connId, default: []].insert(requestUuid)
+            }
+            self.sendEvent("onRequest", [
+                "uuid": requestUuid,
+                "method": req.method.toString(),
+                "path": req.url.path,
+                "body": bodyString,
+                "headersJson": req.allHTTPHeaderFields.jsonString,
+                "paramsJson": req.query.jsonString,
+                "cookiesJson": req.cookies?.jsonString ?? "{}"
+            ])
+        }
     }
 
     private func respondHandler(udid: String,
@@ -119,12 +176,8 @@ public class ExpoHttpServerModule: Module {
         // Copy the typed-array bytes into Data on the JS thread — the backing
         // JavaScript ArrayBuffer may not be safe to touch once we hop to the
         // main queue, and CRResponse.sendData retains the Data itself.
-        let tEnter = CFAbsoluteTimeGetCurrent()
         let data = Data(bytes: body.rawPointer, count: body.byteLength)
-        let tCopied = CFAbsoluteTimeGetCurrent()
-        let shortId = String(udid.prefix(8))
         DispatchQueue.main.async {
-            let tMain = CFAbsoluteTimeGetCurrent()
             if let response = self.responses[udid] {
                 response.setStatusCode(UInt(statusCode), description: statusDescription)
                 response.setValue(contentType, forHTTPHeaderField: "Content-type")
@@ -154,55 +207,63 @@ public class ExpoHttpServerModule: Module {
         }
     }
 
-    private func stopHandler() {
-        stopped = true;
-        stopServer(status: "STOPPED", message: "Server stopped")
-    }
-
-    private func startServer(status: String, message: String) {
-        stopServer()
-        if let port = port {
-            // CRServer retains `delegate` weakly, so we hold the observer on
-            // `self` and wire it before starting. The close callback may fire
-            // on Criollo's delegate queue — marshal back to main where we
-            // touch `uuidToConnection` / `connectionToUuids`.
-            connectionObserver.onConnectionClose = { [weak self] connection in
-                let connId = ObjectIdentifier(connection)
-                DispatchQueue.main.async {
+    /// Attempts `startListening` on `port`. Emits the matching status event
+    /// and returns whether bind succeeded.
+    ///
+    /// Self-guarded against double-bind: if the server is already listening
+    /// (e.g. another caller bound first while this one was queued), returns
+    /// true without re-binding or emitting a duplicate event. Lets the
+    /// `ensureListening` AsyncFunction and the `OnAppEntersForeground`
+    /// observer call this concurrently without serialization.
+    ///
+    /// `retriesRemaining` schedules a delayed retry on bind failure before
+    /// emitting `ERROR`. The foreground-resume path uses one retry to ride
+    /// over the brief window where iOS hasn't released the prior socket.
+    @discardableResult
+    private func bindAndEmit(
+        port: Int,
+        successStatus: String,
+        successMessage: String,
+        retriesRemaining: Int = 0,
+        retryDelay: TimeInterval = 0.15
+    ) -> Bool {
+        if isListening { return true }
+        var error: NSError?
+        server.startListening(&error, portNumber: UInt(port))
+        if let error = error {
+            if retriesRemaining > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
                     guard let self = self else { return }
-                    guard let uuids = self.connectionToUuids.removeValue(forKey: connId) else { return }
-                    for uuid in uuids {
-                        self.uuidToConnection[uuid] = nil
-                        self.sendEvent("onRequestCancel", ["uuid": uuid])
-                    }
+                    guard !self.isListening, !self.userStopped else { return }
+                    self.bindAndEmit(
+                        port: port,
+                        successStatus: successStatus,
+                        successMessage: successMessage,
+                        retriesRemaining: retriesRemaining - 1,
+                        retryDelay: retryDelay
+                    )
                 }
+                return false
             }
-            server.delegate = connectionObserver
-            var error: NSError?
-            server.startListening(&error, portNumber: UInt(port))
-            if (error != nil) {
-                sendEvent("onStatusUpdate", [
-                    "status": "ERROR",
-                    "message": error?.localizedDescription ?? "Unknown error starting server"
-                ])
-            } else {
-                beginBackgroundTask()
-                sendEvent("onStatusUpdate", [
-                    "status": status,
-                    "message": message
-                ])
-            }
-        } else {
             sendEvent("onStatusUpdate", [
                 "status": "ERROR",
-                "message": "Can't start server with port configured"
+                "message": error.localizedDescription
             ])
+            return false
         }
+        isListening = true
+        sendEvent("onStatusUpdate", [
+            "status": successStatus,
+            "message": successMessage
+        ])
+        return true
     }
 
     private func stopServer(status: String? = nil, message: String? = nil) {
-        server.stopListening()
-        endBackgroundTask()
+        if isListening {
+            server.stopListening()
+            isListening = false
+        }
         if let status = status, let message = message {
             sendEvent("onStatusUpdate", [
                 "status": status,
@@ -213,8 +274,10 @@ public class ExpoHttpServerModule: Module {
 
     private func beginBackgroundTask() {
         if (bgTaskIdentifier == UIBackgroundTaskIdentifier.invalid) {
-            self.bgTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "BgTask", expirationHandler: {
+            self.bgTaskIdentifier = UIApplication.shared.beginBackgroundTask(withName: "ExpoHttpServerBg", expirationHandler: { [weak self] in
+                guard let self = self else { return }
                 self.stopServer(status: "PAUSED", message: "Server paused")
+                self.endBackgroundTask()
             })
         }
     }
@@ -245,6 +308,8 @@ extension CRHTTPMethod {
             return "PUT"
         case .delete:
             return "DELETE"
+        case .options:
+            return "OPTIONS"
         default:
             return "GET"
         }
@@ -259,6 +324,8 @@ extension CRHTTPMethod {
             httpMethod = .put
         case "DELETE":
             httpMethod = .delete
+        case "OPTIONS":
+            httpMethod = .options
         default:
             httpMethod = .get
         }

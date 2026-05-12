@@ -2,13 +2,9 @@ import { EventEmitter } from "expo-modules-core";
 
 import ExpoHttpServerModule from "./ExpoHttpServerModule";
 
-const emitter = new EventEmitter(ExpoHttpServerModule);
-const requestCallbacks: Callback[] = [];
-
 export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS";
-/**
- * PAUSED AND RESUMED are iOS only
- */
+
+/** PAUSED/RESUMED fire on both platforms around app-lifecycle transitions. */
 export type Status = "STARTED" | "PAUSED" | "RESUMED" | "STOPPED" | "ERROR";
 
 export interface StatusEvent {
@@ -19,8 +15,6 @@ export interface StatusEvent {
 export interface RequestEvent {
   /** Per-request uuid. Use this to respond to a specific connection. */
   uuid: string;
-  /** Route-level uuid, shared by every request to the same path+method pair. */
-  routeUuid: string;
   method: string;
   path: string;
   body: string;
@@ -36,7 +30,16 @@ export interface RequestEvent {
   signal: AbortSignal;
 }
 
-/** Payload for the native `onRequestCancel` event — matches `RequestEvent.uuid`. */
+interface NativeRequestEvent {
+  uuid: string;
+  method: string;
+  path: string;
+  body: string;
+  headersJson: string;
+  paramsJson: string;
+  cookiesJson: string;
+}
+
 interface RequestCancelEvent {
   uuid: string;
 }
@@ -55,105 +58,144 @@ export interface Response {
   body?: string | Uint8Array;
 }
 
-export interface Callback {
-  method: string;
-  path: string;
-  uuid: string;
-  callback: (request: RequestEvent) => Promise<Response>;
+export type RouteHandler = (request: RequestEvent) => Promise<Response>;
+
+export interface EnsureStartedOptions {
+  port: number;
+  onStatus?: (event: StatusEvent) => void;
 }
 
-// Per-request AbortControllers, keyed by the native request uuid. Populated
-// when the route callback is dispatched and cleared once the response is
-// written. The native side fires `onRequestCancel` when the client closes
-// the TCP connection before we respond.
+// ---------------------------------------------------------------------------
+// Module-import-time state. Lives for the JS context's lifetime.
+//
+// Layering: the route table and the emitter subscriptions are JS-context-
+// scoped — fresh on every JS reload, exactly when we want them fresh. The
+// native side keeps process-scoped state (server, catch-all route, lifecycle
+// observers) wired in its OnCreate, so it survives JS reloads without
+// stacking.
+// ---------------------------------------------------------------------------
+
+const emitter = new EventEmitter(ExpoHttpServerModule);
+
+const routes = new Map<string, RouteHandler>();
 const inFlightControllers = new Map<string, AbortController>();
 
-export const start = () => {
-  emitter.addListener<RequestCancelEvent>("onRequestCancel", (event) => {
-    const controller = inFlightControllers.get(event.uuid);
-    if (controller) {
-      controller.abort(new Error("Client disconnected"));
-    }
-  });
+let statusSubscription: { remove: () => void } | null = null;
 
-  emitter.addListener<RequestEvent>("onRequest", async (event) => {
-    // Look up the handler by routeUuid (stable across requests); reply with
-    // event.uuid (unique per request) so concurrent connections don't collide.
-    const responseHandler = requestCallbacks.find((c) => c.uuid === event.routeUuid);
-    if (!responseHandler) {
+const routeKey = (method: string, path: string) => `${method.toUpperCase()} ${path}`;
+
+emitter.addListener<NativeRequestEvent>("onRequest", async (event) => {
+  const handler = routes.get(routeKey(event.method, event.path));
+  if (!handler) {
+    ExpoHttpServerModule.respond(
+      event.uuid,
+      404,
+      "Not Found",
+      "application/json",
+      {},
+      JSON.stringify({ error: "Handler not found" }),
+    );
+    return;
+  }
+
+  const controller = new AbortController();
+  inFlightControllers.set(event.uuid, controller);
+  const enriched: RequestEvent = { ...event, signal: controller.signal };
+
+  try {
+    const response = await handler(enriched);
+    const statusCode = response.statusCode ?? 200;
+    const statusDescription = response.statusDescription ?? "OK";
+    const contentType = response.contentType ?? "application/json";
+    const headers = response.headers ?? {};
+    const body = response.body;
+    if (body instanceof Uint8Array) {
+      ExpoHttpServerModule.respondBinary(
+        event.uuid,
+        statusCode,
+        statusDescription,
+        contentType,
+        headers,
+        body,
+      );
+    } else {
       ExpoHttpServerModule.respond(
         event.uuid,
-        404,
-        "Not Found",
+        statusCode,
+        statusDescription,
+        contentType,
+        headers,
+        body ?? "{}",
+      );
+    }
+  } catch (err) {
+    // Native is still waiting for a respond/respondBinary against event.uuid —
+    // without one, the busy-wait loop pins a Netty worker (Android) or the
+    // CRResponse stays in the responses map forever (iOS). Reply with a 500
+    // so the slot drains and the client sees a real error.
+    console.warn(
+      `[expo-http-server] handler threw for ${event.method} ${event.path}:`,
+      err,
+    );
+    try {
+      ExpoHttpServerModule.respond(
+        event.uuid,
+        500,
+        "Internal Server Error",
         "application/json",
         {},
-        JSON.stringify({ error: "Handler not found" }),
+        JSON.stringify({ error: "Handler threw" }),
       );
-      return;
+    } catch {
+      // Native module unloading or already-responded — nothing more to do.
     }
-
-    const controller = new AbortController();
-    inFlightControllers.set(event.uuid, controller);
-    const enrichedEvent: RequestEvent = { ...event, signal: controller.signal };
-
-    try {
-      const response = await responseHandler.callback(enrichedEvent);
-      const statusCode = response.statusCode || 200;
-      const statusDescription = response.statusDescription || "OK";
-      const contentType = response.contentType || "application/json";
-      const headers = response.headers ?? {};
-      const body = response.body;
-      if (body instanceof Uint8Array) {
-        ExpoHttpServerModule.respondBinary(
-          event.uuid,
-          statusCode,
-          statusDescription,
-          contentType,
-          headers,
-          body,
-        );
-      } else {
-        ExpoHttpServerModule.respond(
-          event.uuid,
-          statusCode,
-          statusDescription,
-          contentType,
-          headers,
-          body ?? "{}",
-        );
-      }
-    } finally {
-      inFlightControllers.delete(event.uuid);
-    }
-  });
-  ExpoHttpServerModule.start();
-};
-
-export const route = (
-  path: string,
-  method: HttpMethod,
-  callback: (request: RequestEvent) => Promise<Response>,
-) => {
-  const uuid = Math.random().toString(16).slice(2);
-  requestCallbacks.push({
-    method,
-    path,
-    uuid,
-    callback,
-  });
-  ExpoHttpServerModule.route(path, method, uuid);
-};
-
-export const setup = (
-  port: number,
-  onStatusUpdate?: (event: StatusEvent) => void,
-) => {
-  if (onStatusUpdate) {
-    emitter.addListener<StatusEvent>("onStatusUpdate", async (event) => {
-      onStatusUpdate(event);
-    });
+  } finally {
+    inFlightControllers.delete(event.uuid);
   }
-  ExpoHttpServerModule.setup(port);
+});
+
+emitter.addListener<RequestCancelEvent>("onRequestCancel", (event) => {
+  const controller = inFlightControllers.get(event.uuid);
+  if (controller) {
+    controller.abort(new Error("Client disconnected"));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Register (or replace) a JS handler for a path+method. Pure JS — no native
+ * call, idempotent across registrations of the same key, and safe to call
+ * before or after the server is listening.
+ */
+export const route = (path: string, method: HttpMethod, callback: RouteHandler): void => {
+  routes.set(routeKey(method, path), callback);
 };
 
-export const stop = () => ExpoHttpServerModule.stop();
+/**
+ * Ensure the native server is listening on `opts.port`. Idempotent:
+ *   - already listening on this port → resolves immediately
+ *   - listening on a different port → rebinds, resolves on STARTED
+ *   - not listening → binds, resolves on STARTED, rejects on ERROR
+ *
+ * `onStatus` replaces any prior status subscription (the native side fires
+ * STARTED/PAUSED/RESUMED/STOPPED/ERROR for lifecycle transitions).
+ */
+export const ensureStarted = (opts: EnsureStartedOptions): Promise<void> => {
+  if (statusSubscription) {
+    statusSubscription.remove();
+    statusSubscription = null;
+  }
+  if (opts.onStatus) {
+    statusSubscription = emitter.addListener<StatusEvent>("onStatusUpdate", opts.onStatus);
+  }
+  return ExpoHttpServerModule.ensureListening(opts.port);
+};
+
+/**
+ * Stop the native server. Safe to call when not started. Does not clear the
+ * JS-side route table — a subsequent `ensureStarted` will reuse it.
+ */
+export const stop = (): Promise<void> => ExpoHttpServerModule.stop();
