@@ -195,6 +195,16 @@ export const ensureStarted = (opts: EnsureStartedOptions): Promise<void> => {
 };
 
 /**
+ * Subscribe to status transitions for the process's lifetime. Unlike
+ * `ensureStarted`'s `onStatus`, this listener is never replaced by a later
+ * `ensureStarted` — use it to watch for a bind the native side performs on its
+ * own (foreground resume) or loses without JS asking.
+ */
+export const addStatusListener = (
+  listener: (event: StatusEvent) => void,
+): { remove: () => void } => emitter.addListener<StatusEvent>("onStatusUpdate", listener);
+
+/**
  * Stop the native server. Safe to call when not started. Does not clear the
  * JS-side route table — a subsequent `ensureStarted` will reuse it.
  */
