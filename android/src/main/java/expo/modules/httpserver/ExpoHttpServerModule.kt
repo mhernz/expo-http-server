@@ -68,9 +68,12 @@ class ExpoHttpServerModule : Module() {
      */
     private const val BIND_ATTEMPTS = 4
     private const val BIND_RETRY_DELAY_MS = 150L
-    /** The resume path runs on the UI thread, so it stays cheap and leaves the
-     *  long tail to the JS backoff loop, which reacts to the ERROR event. */
-    private const val RESUME_BIND_ATTEMPTS = 2
+    private const val BIND_TIMEOUT_MS = 2_000L
+
+    /** Foreground rebinds wait on the bind, so they run here, off the UI thread. */
+    private val resumeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    /** Lets a queued rebind see that the app went back to the background. */
+    @Volatile private var inForeground = true
 
     /** Guards every mutation of `server` — the JS thread and the activity
      *  lifecycle callbacks both get there. */
@@ -236,30 +239,73 @@ class ExpoHttpServerModule : Module() {
       }
     }
 
+    private fun extractServerChannel(server: Server): io.netty.channel.Channel? =
+      extractBindFuture(server)?.channel()
+
     /**
-     * Pull the bound server-channel out of safframework's AndroidServer via
-     * reflection so we can `await` its `closeFuture` during teardown. Walks
-     * the class hierarchy because the channel field may live on a superclass.
-     * Returns null if no `Channel`-typed field is found — caller degrades to
-     * best-effort close.
+     * AndroidServer binds on a thread of its own and keeps the bind future in a
+     * private `channelFuture` field; it is null until that thread gets going.
      */
-    private fun extractServerChannel(server: Server): io.netty.channel.Channel? {
-      var cls: Class<*>? = server.javaClass
-      while (cls != null) {
-        for (field in cls.declaredFields) {
-          if (io.netty.channel.Channel::class.java.isAssignableFrom(field.type)) {
-            try {
-              field.isAccessible = true
-              val value = field.get(server)
-              if (value is io.netty.channel.Channel) return value
-            } catch (e: Throwable) {
-              // Try the next field.
-            }
-          }
-        }
-        cls = cls.superclass
+    private fun extractBindFuture(server: Server): io.netty.channel.ChannelFuture? {
+      return try {
+        val field = server.javaClass.getDeclaredField("channelFuture")
+        field.isAccessible = true
+        field.get(server) as? io.netty.channel.ChannelFuture
+      } catch (e: Throwable) {
+        null
       }
-      return null
+    }
+
+    /**
+     * AndroidServer's bind thread rethrows a failed bind with no handler, which
+     * kills the process, so a taken port has to be caught before it starts.
+     * A port taken between this check and the bind still gets through.
+     */
+    private fun isPortFree(port: Int): Boolean {
+      return try {
+        java.net.ServerSocket().use {
+          it.reuseAddress = true
+          it.bind(java.net.InetSocketAddress(port))
+        }
+        true
+      } catch (e: java.io.IOException) {
+        false
+      }
+    }
+
+    /**
+     * Close a server whose bind failed or timed out. Its bind thread may still
+     * bind after close() has run, so the channel is closed once that settles.
+     */
+    private fun discard(s: Server) {
+      try {
+        s.close()
+      } catch (e: Throwable) {
+        // Nothing to salvage.
+      }
+      val closeWhenBound = { f: io.netty.channel.ChannelFuture ->
+        f.addListener { if (it.isSuccess) f.channel().close() }
+      }
+      extractBindFuture(s)?.let(closeWhenBound) ?: kotlin.concurrent.thread(isDaemon = true) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+        while (System.nanoTime() < deadline) {
+          extractBindFuture(s)?.let { closeWhenBound(it); return@thread }
+          Thread.sleep(50)
+        }
+      }
+    }
+
+    /** Wait for AndroidServer's bind thread to finish. */
+    private fun awaitBind(server: Server, timeoutMs: Long): Boolean {
+      val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+      var future = extractBindFuture(server)
+      while (future == null && System.nanoTime() < deadline) {
+        Thread.sleep(5)
+        future = extractBindFuture(server)
+      }
+      if (future == null) return false
+      val remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+      return future.await(remaining.coerceAtLeast(0)) && future.isSuccess
     }
   }
 
@@ -298,6 +344,7 @@ class ExpoHttpServerModule : Module() {
     // foreground regardless of whether Android decides to kill the process.
     OnActivityEntersBackground {
       if (!isActive) return@OnActivityEntersBackground
+      inForeground = false
       synchronized(bindLock) {
         if (userStopped || listeningPort == null || server == null) return@synchronized
         closeServerAwait()
@@ -312,19 +359,17 @@ class ExpoHttpServerModule : Module() {
     // didn't explicitly stop us.
     OnActivityEntersForeground {
       if (!isActive) return@OnActivityEntersForeground
-      synchronized(bindLock) {
-        if (userStopped || server != null) return@synchronized
-        val port = listeningPort ?: return@synchronized
-        if (!bindWithRetry(
-              port,
-              successStatus = "RESUMED",
-              successMessage = "Server resumed",
-              attempts = RESUME_BIND_ATTEMPTS
-            )) {
-          sendEvent("onStatusUpdate", bundleOf(
-            "status" to "ERROR",
-            "message" to "Failed to rebind HTTP server to port $port"
-          ))
+      inForeground = true
+      resumeExecutor.execute {
+        synchronized(bindLock) {
+          if (!inForeground || !isActive || userStopped || server != null) return@synchronized
+          val port = listeningPort ?: return@synchronized
+          if (!bindWithRetry(port, successStatus = "RESUMED", successMessage = "Server resumed")) {
+            sendEvent("onStatusUpdate", bundleOf(
+              "status" to "ERROR",
+              "message" to "Failed to rebind HTTP server to port $port"
+            ))
+          }
         }
       }
     }
@@ -432,8 +477,11 @@ class ExpoHttpServerModule : Module() {
 
   private fun tryBind(port: Int, successStatus: String, successMessage: String): Boolean {
     return try {
-      server = buildServerWithCatchAll(port)
-      server?.start()
+      if (!isPortFree(port)) return false
+      val s = buildServerWithCatchAll(port)
+      server = s
+      s.start()
+      if (!awaitBind(s, BIND_TIMEOUT_MS)) throw IllegalStateException("bind to $port did not complete")
       sendEvent("onStatusUpdate", bundleOf(
         "status" to successStatus,
         "message" to successMessage
@@ -441,11 +489,7 @@ class ExpoHttpServerModule : Module() {
       true
     } catch (e: Throwable) {
       // A half-built server can still hold the socket; close before retrying.
-      try {
-        server?.close()
-      } catch (t: Throwable) {
-        // Nothing to salvage.
-      }
+      server?.let(::discard)
       server = null
       false
     }
